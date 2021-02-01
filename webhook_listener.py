@@ -1,6 +1,8 @@
 import hmac
 import logging
-from json import dumps
+import threading, queue
+# import json
+from json import dumps, loads
 from os import X_OK, access, getenv, listdir
 from os.path import join
 from pathlib import Path
@@ -9,7 +11,6 @@ from sys import stderr, exit
 from traceback import print_exc
 
 from flask import Flask, abort, request
-
 
 def get_secret(name):
     """Tries to read Docker secret or corresponding environment variable.
@@ -56,7 +57,9 @@ if webhook_secret is None:
     exit(1)
 
 # Get branch list that we'll listen to, defaulting to just 'master'
-branch_whitelist = getenv('WEBHOOK_BRANCH_LIST', 'master').split(',')
+branch_whitelist = getenv('WEBHOOK_BRANCH_LIST', '').split(',')
+if len(branch_whitelist) == 1 and not branch_whitelist[0]:
+    branch_whitelist=[]
 
 # Our Flask application
 application = Flask(__name__)
@@ -64,6 +67,35 @@ application = Flask(__name__)
 # Keep the logs of the last execution around
 responses = {}
 
+q = queue.Queue()
+
+def worker():
+    while True:
+        pullRequest = q.get()
+        # run scripts in code\hooks - 01_print_branch, 02_checkout and 03_pr_comment
+        responses = {}
+        logging.info("Processing: " + pullRequest["prTitle"] + " #" + pullRequest["number"] + " " + pullRequest["action"] + " event")
+        for script in scripts:
+            proc = Popen([script, pullRequest["prTitle"], pullRequest["branch"], pullRequest["number"], pullRequest["repoFullName"]], stdout=PIPE, stderr=PIPE)
+            stdout, stderr = proc.communicate()
+            stdout = stdout.decode('utf-8')
+            stderr = stderr.decode('utf-8')
+
+            # Log errors if a hook failed
+            if proc.returncode != 0:
+                logging.error('[%s]: %d\n%s', script, proc.returncode, stderr)
+            else:
+                logging.info(script + " : " + stdout)
+            
+            responses[script] = {
+                'stdout': stdout,
+                'stderr': stderr
+            }
+            
+        # logging.info(dumps(responses))
+        q.task_done()
+
+threading.Thread(target=worker, daemon=True).start()
 
 @application.route('/', methods=['POST'])
 def index():
@@ -100,45 +132,45 @@ def index():
 
     # Respond to ping properly
     if event == "ping":
+        logging.info("pongging the ping")
         return dumps({"msg": "pong"})
 
-    # Don't listen to anything but push
-    if event != "push" and event != "Push Hook":
-        logging.info("Not a push event, aborting")
+    # Don't listen to anything but pull_request
+    if event != "pull_request":
+        logging.info("Not a pull request event, aborting")
         abort(403)
 
     # Try to parse out the branch from the request payload
     try:
-        branch = request.get_json(force=True)["ref"].split("/", 2)[2]
+        # branch = requestJson["ref"].split("/", 2)[2]
+        requestJson = request.get_json(force=True)
     except:
         print_exc()
-        logging.info("Parsing payload failed")
+        logging.info("Parsing payload failed. Is the content type application/json?")
         abort(400)
 
-    # Reject branches not in our whitelist
-    if branch not in branch_whitelist:
+    # action = request.get_json(force=True)["action"]
+    action = requestJson["action"]
+    if action != "opened" and action != "synchronize":
+        logging.info("Not a pull request opened or synchronize event")
+
+    number = str(requestJson["number"])
+    pullrequest = requestJson["pull_request"]
+    branch = pullrequest["head"]["ref"]
+    repoFullName = pullrequest["head"]["repo"]["full_name"]
+    prTitle = pullrequest["title"]
+
+    # Reject branches not in our whitelist (if not empty)
+    if len(branch_whitelist) > 0 and branch not in branch_whitelist:
         logging.info("Branch %s not in branch_whitelist %s",
                      branch, branch_whitelist)
         abort(403)
     
-    # Run scripts, saving into responses (which we clear out)
-    responses = {}
-    for script in scripts:
-        proc = Popen([script, branch], stdout=PIPE, stderr=PIPE)
-        stdout, stderr = proc.communicate()
-        stdout = stdout.decode('utf-8')
-        stderr = stderr.decode('utf-8')
+    # Queue valid PR opened/synchronized webhook
+    q.put({"prTitle" : prTitle, "branch": branch, "number" : number, "repoFullName" : repoFullName, "action" : action})
+    logging.info("Queued: " + prTitle + " #" + number + " " + action + " event")
 
-        # Log errors if a hook failed
-        if proc.returncode != 0:
-            logging.error('[%s]: %d\n%s', script, proc.returncode, stderr)
-        
-        responses[script] = {
-            'stdout': stdout,
-            'stderr': stderr
-        }
-
-    return dumps(responses)
+    return dumps(({"response": "Queuing " + prTitle}))
 
 @application.route('/logs', methods=['GET'])
 def logs():

@@ -1,0 +1,43 @@
+version: '3'
+services:
+    # frontend: # WORK IN PROGRESS
+    #     image: nginx
+    #     container_name: reverse_proxy
+    #     # depends_on: 
+    #         # - webhook
+    #     volumes:
+    #         - ./reverse_proxy/nginx.conf:/etc/nginx/nginx.conf
+    #     ports:
+    #         - 80:80
+    #     environment:
+    #         # - NGINX_HOST=foobar.com
+    #         - NGINX_PORT=80
+    relay:
+        container_name: webhookrelay
+        build:
+            context: ./relay
+            args: 
+                - RELAY_KEY=aaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeee # REQUIRED! update this value
+                - RELAY_SECRET=fakesecret # REQUIRED! update this value
+                - RELAY_BUCKET=relayBucket # OPTIONAL update this value if you want to change the bucket id in relay
+        network_mode: host
+        restart: always
+    webhook:
+        restart: unless-stopped
+        build: .
+        # depends_on: 
+        #     - relay
+        container_name: webhook
+        volumes:
+            # Mount this code into /code
+            - ./code:/code
+            # Mount the docker socketasd
+            - /var/run/docker.sock:/var/run/docker.sock
+        environment:
+            - WEBHOOK_SECRET=verysecret # REQUIRED! update this value. this has to match with your GitHub webhook secret
+            - WEBHOOK_HOOKS_DIR=/code/hooks # OPTIONAL
+            # - WEBHOOK_BRANCH_LIST=master # OPTIONAL uncomment to create a branch whitelist
+        expose: 
+            - 8000
+        ports:
+            - 8000:8000
